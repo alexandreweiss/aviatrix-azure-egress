@@ -48,11 +48,18 @@ resource "azurerm_subnet" "gw-subnet" {
   virtual_network_name = azurerm_virtual_network.azure_spoke_marketing_vnet.name
 }
 
-resource "azurerm_subnet" "bastion-subnet" {
+resource "azurerm_subnet" "aci-subnet" {
   address_prefixes     = ["10.1.3.64/27"]
-  name                 = "AzureBastionSubnet"
+  name                 = "aci-subnet"
   resource_group_name  = azurerm_resource_group.marketing_spoke_rg.name
   virtual_network_name = azurerm_virtual_network.azure_spoke_marketing_vnet.name
+  delegation {
+    name = "delegation"
+    service_delegation {
+      name    = "Microsoft.ContainerInstance/containerGroups"
+      actions = ["Microsoft.Network/virtualNetworks/subnets/action"]
+    }
+  }
 }
 
 resource "azurerm_subnet" "mktg-app-subnet" {
@@ -83,14 +90,25 @@ resource "azurerm_route_table" "marketing_application_rt" {
 
 # Attach route table to Marketing application subnet
 resource "azurerm_subnet_route_table_association" "marketing_route_table_assoc" {
+  count = var.isStep2 ? 1 : 0
+
   route_table_id = azurerm_route_table.marketing_application_rt.id
   subnet_id      = azurerm_subnet.mktg-app-subnet.id
+}
+
+# Attach route table to Marketing ACI application subnet
+resource "azurerm_subnet_route_table_association" "marketing_aci_route_table_assoc" {
+  count = var.isStep2 ? 1 : 0
+
+  route_table_id = azurerm_route_table.marketing_application_rt.id
+  subnet_id      = azurerm_subnet.aci-subnet.id
 }
 
 # Creation of the Marketing application spoke and attachment to transit
 module "azure_spoke_marketing" {
   source  = "terraform-aviatrix-modules/mc-spoke/aviatrix"
   version = "1.6.5"
+  count   = var.isStep2 ? 1 : 0
 
   name             = "azure-mktg-spoke"
   cloud            = "azure"
@@ -103,27 +121,25 @@ module "azure_spoke_marketing" {
   use_existing_vpc = true
   vpc_id           = "${azurerm_virtual_network.azure_spoke_marketing_vnet.name}:${azurerm_resource_group.marketing_spoke_rg.name}:${azurerm_virtual_network.azure_spoke_marketing_vnet.guid}"
   gw_subnet        = azurerm_subnet.gw-subnet.address_prefixes[0]
-  depends_on       = [module.azure_hub]
+  single_ip_snat   = true
+  instance_size    = "Standard_B2ms"
+  depends_on       = [azurerm_subnet_route_table_association.marketing_route_table_assoc]
 }
 
-# # Creation of Azure Bastion to access Marketing application VM
-# resource "azurerm_bastion_host" "bastion" {
-#   location            = var.region
-#   name                = "bastion"
-#   resource_group_name = azurerm_resource_group.marketing_spoke_rg.name
-#   ip_configuration {
-#     name                 = "ipConfig"
-#     public_ip_address_id = azurerm_public_ip.bastion_pip
-#     subnet_id            = azurerm_subnet.bastion-subnet.id
-#   }
-# }
+resource "aviatrix_gateway_dnat" "dnat_rules_spoke_marketing" {
+  count   = var.isStep2 ? 1 : 0
+  gw_name = module.azure_spoke_marketing[0].spoke_gateway.gw_name
 
-# resource "azurerm_public_ip" "bastion_pip" {
-#   allocation_method   = "Static"
-#   location            = var.region
-#   name                = "bastion-pip"
-#   resource_group_name = azurerm_resource_group.marketing_spoke_rg.name
-# }
+  dnat_policy {
+    src_cidr          = var.source_ip
+    dst_cidr          = "${module.azure_spoke_marketing[0].spoke_gateway.private_ip}/32"
+    dnat_ips          = azurerm_container_group.container-group.ip_address
+    dst_port          = "80"
+    protocol          = "tcp"
+    dnat_port         = "8080"
+    apply_route_entry = true
+  }
+}
 
 # Creation of test VMs
 resource "azurerm_resource_group" "vms_rg" {
@@ -131,6 +147,7 @@ resource "azurerm_resource_group" "vms_rg" {
   name     = "vms-rg"
 }
 
+# Accounting VM in Accounting spoke vnet
 module "accounting_vm" {
   source              = "github.com/alexandreweiss/misc-tf-modules/azr-linux-vm"
   environment         = "acct"
@@ -144,6 +161,28 @@ module "accounting_vm" {
   ]
 }
 
+# Marketing application VM in the Marketing spoke vnet installing probes to external sites
+# User Data bootstrap preparation
+
+data "template_file" "gatus-config" {
+  template = file("${path.module}/mktg-cloud-init.tpl")
+
+  vars = {
+    "accounting_vm_ip" = module.accounting_vm.vm_private_ip
+  }
+}
+
+data "template_cloudinit_config" "config" {
+  gzip          = true
+  base64_encode = true
+
+  part {
+    content_type = "text/cloud-config"
+    content      = data.template_file.gatus-config.rendered
+  }
+}
+
+# Marketing VM with bootstrap script rendered as custom_data
 module "marketing_vm" {
   source              = "github.com/alexandreweiss/misc-tf-modules/azr-linux-vm"
   environment         = "mktg"
@@ -153,6 +192,5 @@ module "marketing_vm" {
   resource_group_name = azurerm_resource_group.vms_rg.name
   subnet_id           = azurerm_subnet.mktg-app-subnet.id
   admin_ssh_key       = var.ssh_public_key
-  depends_on = [
-  ]
+  custom_data         = data.template_cloudinit_config.config.rendered
 }

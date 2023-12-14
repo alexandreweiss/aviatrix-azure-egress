@@ -1,5 +1,6 @@
-variable "controller_ip" {
-  description = "Define your Aviatrix controller IP address or FQDN"
+variable "controller_fqdn" {
+  description = "FQDN or IP of the Aviatrix Controller"
+  sensitive   = true
 }
 
 variable "controller_password" {
@@ -23,4 +24,14 @@ variable "region_short" {
 
 variable "ssh_public_key" {
   description = "SSH public key to access test VMs"
+}
+
+variable "isStep2" {
+  description = "Deploy Marketing spoke and enforce egress after Marketing VM is bootstrapped"
+  default     = true
+}
+
+variable "source_ip" {
+  description = "Your source IP to surf the container throught MKTG spoke DNAT"
+  default     = "81.49.43.155/32"
 }
